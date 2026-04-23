@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # run_all.sh
 #
 # Local execution script for the Chi‑Square MapReduce pipeline.
@@ -8,13 +9,7 @@
 #
 # Default input:         data/reviews_devset.json
 # Default stopwords:     src/stopwords.txt
-#
-# Steps:
-#   1. Job 1 – tokenise, filter, count
-#   2. Job 2 – aggregate term totals
-#   3. prepare_side_data.py – extract static stats from Job 2 output
-#   4. Job 3 – distributed chi‑square computation using side data
-#   5. format_output.py – final formatting
+
 set -e
 
 INPUT=${1:-data/reviews_devset.json}
@@ -26,11 +21,8 @@ python src/chi_square_job_1.py "$INPUT" --stopwords "$STOPWORDS" > job1_output.t
 echo "Running Job 2..."
 python src/chi_square_job_2.py job1_output.txt > job2_output.txt
 
-echo "Preparing side data..."
-python src/prepare_side_data.py job2_output.txt side_data.json
-
-echo "Running Job 3 (efficient, distributed)..."
-python src/chi_square_job_3.py job2_output.txt --side-data side_data.json > final_output.txt
+echo "Running Job 3..."
+python src/chi_square_job_3.py job2_output.txt > final_output.txt
 
 echo "Formatting final output..."
 python src/format_output.py

@@ -1,115 +1,124 @@
 """
-Job 3: Compute chi‑square values and select top 75 terms per category.
+Job 3 (efficient, distributed version): Compute chi‑square and select top 75 terms per category.
 
 Mapper input:
-    - Output of Job 2, same text format.
+    - Output of Job 2 (text lines).  Only lines with key "TERM_IN_CATEGORY" are used.
+      Format: '["TERM_IN_CATEGORY", "<category>", "<term>"]\t<count>'
 
 Mapper output:
-    - All records are sent to a single reducer under the dummy key "ALL".
-      Each record is preserved as a tuple (key, value).
+    - key:   <category>               (so data is grouped by category)
+    - value: (<term>, <count>)        (the A value for that term)
 
 Reducer input:
-    - key: "ALL"
-    - values: iterator of ((key_type, ...), count) tuples.
+    - key:   a specific category
+    - values: iterator of (<term>, count) tuples
 
 Reducer output:
-    - category -> (term, chi_square_value)   for the top 75 terms per category.
+    - key:   category
+    - value: (<term>, chi_square_value)   only for the top 75 terms in that category.
+
+Side data:
+    - A JSON file (side_data.json) containing:
+        "global_total": N
+        "category_totals": {category: total_reviews}
+        "term_totals": {term: total_reviews_containing_term}
+    This file is loaded by each reducer in reducer_init() and used to compute the
+    contingency table for every (category, term) pair.
+
+This way we have:
+- No reducer bottleneck - work is partitioned by the 22 categories. Each reducer only sees the terms for its assigned category and all statistics are read from locad side data JSON file.
+- scalable and efficient - no single reducer has to handle all terms, and the side data is small enough to be loaded into memory by each reducer, eliminating the need for shuffling these statistics.
 """
+
 from mrjob.job import MRJob
 import json
 
 
 class ChiSquareJob3(MRJob):
     """
-    Third MapReduce job: Compute chi‑square and keep only the most discriminating terms.
+    Distributed chi‑square computation using side data.
     """
+
+    def configure_args(self):
+        """Accept an optional --side-data argument for the prepared side data file."""
+        super(ChiSquareJob3, self).configure_args()
+        self.add_file_arg('--side-data', help='Path to side data JSON file')
+
+    def mapper_init(self):
+        """
+        Nothing to initialise in the mapper.
+        (The reducer initialisation loads the side data.)
+        """
+        pass
+
     def mapper(self, _, line):
         """
-        Reads one line of Job 2 output and forwards it to the reducer.
+        Extract only TERM_IN_CATEGORY records and emit them keyed by category.
 
-        Yielded key:
-            "ALL"   ->   (original_key_tuple, count)
+        Ignores CATEGORY_TOTAL, GLOBAL_TOTAL, and TERM_TOTAL lines because
+        their data is already present in the side data file.
         """
         try:
             key_str, value_str = line.rsplit('\t', 1)
             key = json.loads(key_str)
             value = int(value_str)
 
-            yield "ALL", (key, value)
-
+            if key[0] == "TERM_IN_CATEGORY":
+                _, category, term = key
+                # Emit with category as key to group data per category
+                yield category, (term, value)
         except Exception:
             pass
 
-    def reducer(self, _, records):
+    def reducer_init(self):
         """
-        Collect all counts, compute chi‑square, and output top 75 terms per category.
-
-        Stores:
-            category_totals: dict  {category: total_reviews_in_category}
-            term_totals:     dict  {term: total_reviews_containing_term}
-            term_in_category: dict {(category, term): count_A}
-            global_total:    int   N (total number of reviews)
-
-        For each (category, term) where A > 0, we build a 2x2 contingency table:
-            A = reviews in category containing the term
-            B = term_total - A    (reviews not in category that contain the term)
-            C = category_total - A (reviews in category without the term)
-            D = N - A - B - C     (reviews neither in category nor containing the term)
-
-        chi_square = N * (A*D - B*C)^2 / ((A+B)*(C+D)*(A+C)*(B+D))
-
-        Only the top 75 terms per category (by descending chi‑square) are kept.
+        Load the side data file into three dictionaries accessible by all
+        reducers on their respective nodes.
         """
-        category_totals = {}
-        term_totals = {}
-        term_in_category = {}
-        global_total = 0
+        with open(self.options.side_data, 'r', encoding='utf-8') as f:
+            side = json.load(f)
 
-        # First pass: collect all aggregated counts from the input records
-        for key, value in records:
-            if key[0] == "CATEGORY_TOTAL":
-                _, category = key
-                category_totals[category] = value
+        self.global_total = side["global_total"]
+        self.category_totals = side["category_totals"]
+        self.term_totals = side["term_totals"]
 
-            elif key[0] == "GLOBAL_TOTAL":
-                global_total = value
+    def reducer(self, category, term_counts):
+        """
+        Compute chi‑square for all terms in the given category.
 
-            elif key[0] == "TERM_TOTAL":
-                _, term = key
-                term_totals[term] = value
-
-            elif key[0] == "TERM_IN_CATEGORY":
-                _, category, term = key
-                term_in_category[(category, term)] = value
-
-        # Compute chi‑square for each (category, term) pair
-        results = {} # category -> list of (term, score)
-
-        for (category, term), A in term_in_category.items():
-            category_total = category_totals.get(category, 0)
-            term_total = term_totals.get(term, 0)
-            N = global_total
-
+        For each term:
+            A = count of documents in this category containing the term
             B = term_total - A
             C = category_total - A
             D = N - A - B - C
 
-            denominator = (A + B) * (C + D) * (A + C) * (B + D)
+        chi_square = N * (A*D - B*C)^2 / ((A+B)*(C+D)*(A+C)*(B+D))
 
-            if denominator > 0:
-                chi_square = ((A * D - B * C) ** 2) * N / denominator
+        Only the top 75 terms by chi‑square are kept and emitted.
+        """
+        N = self.global_total
+        cat_total = self.category_totals.get(category, 0)
 
-                if category not in results:
-                    results[category] = []
+        terms_list = []   # will hold (term, chi_square)
 
-                results[category].append((term, chi_square))
-                
-        # For each category, sort by score descending and keep top 75
-        for category in results:
-            top_terms = sorted(results[category], key=lambda x: x[1], reverse=True)[:75]
+        for term, A in term_counts:
+            term_total = self.term_totals.get(term, 0)
 
-            for term, score in top_terms:
-                yield category, (term, score)
+            B = term_total - A
+            C = cat_total - A
+            D = N - A - B - C
+
+            # denominator components
+            denom = (A + B) * (C + D) * (A + C) * (B + D)
+            if denom > 0:
+                chi = ((A * D - B * C) ** 2) * N / denom
+                terms_list.append((term, chi))
+
+        # Keep only the top 75 (or fewer if there aren't that many)
+        top_75 = sorted(terms_list, key=lambda x: x[1], reverse=True)[:75]
+
+        for term, score in top_75:
+            yield category, (term, score)
 
 
 if __name__ == "__main__":
