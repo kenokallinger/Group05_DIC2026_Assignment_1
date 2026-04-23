@@ -1,4 +1,15 @@
 #!/bin/bash
+
+# run_all.sh
+#
+# Local execution script for the Chi‑Square MapReduce pipeline.
+#
+# Usage:
+#   ./run_all.sh [INPUT_PATH] [STOPWORDS_PATH]
+#
+# Default input:         data/reviews_devset.json
+# Default stopwords:     src/stopwords.txt
+
 set -e
 
 INPUT=${1:-data/reviews_devset.json}
