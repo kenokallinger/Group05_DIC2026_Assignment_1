@@ -30,6 +30,8 @@ This way we have:
 - scalable and efficient - no single reducer has to handle all terms, and the side data is small enough to be loaded into memory by each reducer, eliminating the need for shuffling these statistics.
 """
 
+from collections import defaultdict
+
 from mrjob.job import MRJob
 import json
 
@@ -119,6 +121,21 @@ class ChiSquareJob3(MRJob):
 
         for term, score in top_75:
             yield category, (term, score)
+
+    def combiner(self, category, term_counts):
+        """
+        Locally aggregate term counts for the same category.
+
+        Input:  category  – the category name
+                term_counts – iterator of (term, count) tuples
+
+        Output: category -> (term, aggregated_count)
+        """
+        agg = defaultdict(int)
+        for term, count in term_counts:
+            agg[term] += count
+        for term, total in agg.items():
+            yield category, (term, total)    
 
 
 if __name__ == "__main__":

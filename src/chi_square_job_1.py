@@ -101,6 +101,9 @@ class ChiSquareJob1(MRJob):
         """
         yield key, sum(counts)
 
+    def combiner(self, key, counts):
+        yield key, sum(counts)
+
 
 if __name__ == "__main__":
     ChiSquareJob1.run()

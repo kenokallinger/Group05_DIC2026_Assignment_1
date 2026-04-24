@@ -73,6 +73,9 @@ class ChiSquareJob2(MRJob):
         """
         yield key, sum(values)
 
+    def combiner(self, key, values):
+        yield key, sum(values)
+
 
 if __name__ == "__main__":
     ChiSquareJob2.run()
